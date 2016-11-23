@@ -13,6 +13,7 @@
 
     module private InternalImpl = 
         open Polly
+        open System.Net.Http
 
         let parseConnectionString (connectionString : string) bufferSize =
             let splitKeyValue (s : string) =
@@ -22,7 +23,7 @@
             let indexName (dictionary : IDictionary<string, string>) =
                 let isRolling = dictionary.ContainsKey("Rolling") && bool.Parse(dictionary.["Rolling"])
                 if isRolling then 
-                    dictionary.["Index"] + (DateTime.Now.Date.ToString("yyyy.MM.dd"))
+                    dictionary.["Index"] + "_" + (DateTime.Now.Date.ToString("yyyy_MM_dd"))
                 else
                     dictionary.["Index"]
 
@@ -33,36 +34,37 @@
                 Bulk = bufferSize > 0;
                 Index=indexName dictionary
             }
-
-        type Result =
-            | Success
-            | Failure of string
-        
-        type CircuitBreakerState private (maxFailCount : int, resetTimeSpan: TimeSpan, failCount: int, openTime: DateTime) = 
-                
-                let isClosed = failCount < maxFailCount
-                let isReadyForReset = (DateTime.Now - openTime) > resetTimeSpan
-
-                let prepareReturnValue res = 
-                    match res with 
-                    | Choice1Of2 _ -> 
-                        if isReadyForReset then (Success, CircuitBreakerState(maxFailCount, resetTimeSpan)) else (Success, CircuitBreakerState(maxFailCount, resetTimeSpan, failCount, openTime))
-                    | Choice2Of2 ex -> 
-                        let newFailCount = failCount + 1
-                        if newFailCount > maxFailCount then 
-                            (Failure(ex.ToString()), CircuitBreakerState(maxFailCount, resetTimeSpan, newFailCount, DateTime.Now)) 
-                        else
-                            (Failure(ex.ToString()), CircuitBreakerState(maxFailCount, resetTimeSpan, newFailCount, openTime)) 
-
-                new(maxFailCount : int, resetTimeSpan: TimeSpan) = CircuitBreakerState(maxFailCount, resetTimeSpan, 0, DateTime.MinValue) 
-
-                member x.Execute func = async {
-                    if isClosed || isReadyForReset then
-                        let! res = func() |> Async.Catch
-                        return prepareReturnValue res
-                    else
-                        return (Failure("Circuit Breaker Open"), CircuitBreakerState(maxFailCount, resetTimeSpan, failCount, openTime)) 
-                }
+          
+// *************** Using polly now  
+//        type Result =
+//            | Success
+//            | Failure of string
+//        
+//        type CircuitBreakerState private (maxFailCount : int, resetTimeSpan: TimeSpan, failCount: int, openTime: DateTime) = 
+//                
+//                let isClosed = failCount < maxFailCount
+//                let isReadyForReset = (DateTime.Now - openTime) > resetTimeSpan
+//
+//                let prepareReturnValue res = 
+//                    match res with 
+//                    | Choice1Of2 _ -> 
+//                        if isReadyForReset then (Success, CircuitBreakerState(maxFailCount, resetTimeSpan)) else (Success, CircuitBreakerState(maxFailCount, resetTimeSpan, failCount, openTime))
+//                    | Choice2Of2 ex -> 
+//                        let newFailCount = failCount + 1
+//                        if newFailCount > maxFailCount then 
+//                            (Failure(ex.ToString()), CircuitBreakerState(maxFailCount, resetTimeSpan, newFailCount, DateTime.Now)) 
+//                        else
+//                            (Failure(ex.ToString()), CircuitBreakerState(maxFailCount, resetTimeSpan, newFailCount, openTime)) 
+//
+//                new(maxFailCount : int, resetTimeSpan: TimeSpan) = CircuitBreakerState(maxFailCount, resetTimeSpan, 0, DateTime.MinValue) 
+//
+//                member x.Execute func = async {
+//                    if isClosed || isReadyForReset then
+//                        let! res = func() |> Async.Catch
+//                        return prepareReturnValue res
+//                    else
+//                        return (Failure("Circuit Breaker Open"), CircuitBreakerState(maxFailCount, resetTimeSpan, failCount, openTime)) 
+//                }
                 
         let sendAgent (sendFunction : PostFunction<'a>) (connectionInfoProvider : unit -> ConnectionInfo) (internalErrorHandling : string -> unit) = 
             MailboxProcessor.Start(fun inbox-> 
@@ -70,33 +72,41 @@
                 let resetTimeSpan = TimeSpan.FromMinutes(1.0)
                 let maxFailureCount = 3
                 // the message processing function
-                let rec messageLoop (cirtuitBreaker : CircuitBreakerState) = async {
+                let rec messageLoop = async { // (cirtuitBreaker : CircuitBreakerState) = async {
         
                     // read a message
                     let! msg = inbox.Receive()
+                    let! res = sendFunction (connectionInfoProvider()) msg |> Async.Catch
                     // process a message
-                    let! res = cirtuitBreaker.Execute( fun() -> sendFunction (connectionInfoProvider()) msg )
+//                    let! res = cirtuitBreaker.Execute( fun() -> sendFunction (connectionInfoProvider()) msg )
                 
                     match res with 
-                        | (Success, cbState) -> return! messageLoop cbState
-                        | (Failure(f), cbState) -> 
-                            printfn "Failure %s" f
-                            internalErrorHandling(String.Format("Elasticsearch Appender fail: {0}", f))
-                            return! messageLoop cbState
+                        | Choice1Of2 _ -> ()
+                        | Choice2Of2(ex) -> 
+                            internalErrorHandling(String.Format("Elasticsearch Appender fail: {0}", ex))
+
+                    return! messageLoop
                 }
                 // start the loop 
-                messageLoop (CircuitBreakerState(maxFailureCount, resetTimeSpan))
+                messageLoop // (CircuitBreakerState(maxFailureCount, resetTimeSpan))
             )
         
-        let policy = 
-    
+        let policy internalErrorHanling = Policy.Handle<Exception>()
+                                            .CircuitBreakerAsync(2, TimeSpan.FromMinutes(1.0), (fun ex span -> 
+                                                Console.WriteLine("Failures during sending logs to Elasticsearch. Opening circuit breaker. {0}")), 
+                                                (fun () -> internalErrorHanling("Cirtuit breaker reset.")))
+        
+        let sendFuncWithCircuitBreaker sendFunction internalErrorHanling = 
+            let p = policy internalErrorHanling
+            fun uri events -> async { return! p.ExecuteAsync(fun() -> sendFunction uri events |> Async.StartAsTask) |> Async.AwaitTask }
+
     type Appender(sendFunction : PostFunction<'a>) = 
         inherit BufferingAppenderSkeleton()
         
         let internalLogging = base.ErrorHandler.Error
         let mutable connectionInfo = {Server="";Index="";Port=0;Bulk=false}
 
-        let agent = InternalImpl.sendAgent sendFunction (fun () -> connectionInfo) (fun msg -> internalLogging(msg))
+        let agent = InternalImpl.sendAgent (InternalImpl.sendFuncWithCircuitBreaker sendFunction internalLogging) (fun () -> connectionInfo) (fun msg -> internalLogging(msg))
 
         new() = Appender(Communication.sendFunction())
 

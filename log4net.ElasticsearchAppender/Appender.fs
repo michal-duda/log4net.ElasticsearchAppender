@@ -30,18 +30,19 @@
             { Server="http://" + dictionary.["Server"]; Port=Int32.Parse(dictionary.["Port"]); Bulk = bufferSize > 0; Index=indexName dictionary }
 
         let policy internalErrorHanling = Policy.Handle<Exception>()
-                                            .CircuitBreakerAsync(3, TimeSpan.FromMinutes(1.0), (fun ex span -> 
-                                                internalErrorHanling(sprintf "Failures during sending logs to Elasticsearch. Opening circuit breaker. %O" ex)), 
+                                            .CircuitBreakerAsync(3, TimeSpan.FromMinutes(1.0), 
+                                                (fun ex span -> internalErrorHanling(sprintf "Failures during sending logs to Elasticsearch. Opening circuit breaker. %O" ex)), 
                                                 (fun () -> internalErrorHanling("Cirtuit breaker reset.")))
         
-        let sendFuncWithCircuitBreaker sendFunction internalErrorHanling = 
-            let p = policy internalErrorHanling
-            fun uri events -> async { return! p.ExecuteAsync(fun() -> sendFunction uri events |> Async.StartAsTask) |> Async.AwaitTask }
+        let sendFuncWithCircuitBreaker sendFunction (connectionInfoProvider : unit -> ConnectionInfo) internalErrorHandling = 
+            let p = policy internalErrorHandling
+            fun events -> async { return! p.ExecuteAsync(fun() -> sendFunction (connectionInfoProvider()) events |> Async.StartAsTask) |> Async.AwaitTask }
     
+
     module ProcessingAgents =       
-        
           
-        let mailboxProcessor (sendFunction : PostFunction<'a>) (connectionInfoProvider : unit -> ConnectionInfo) (internalErrorHandling : string -> unit) = 
+        let mailboxProcessor (sendFunction : LoggingEvent[] -> Async<'a>) (internalErrorHandling : string -> unit) = 
+            
             MailboxProcessor.Start(fun inbox-> 
                 
                 let resetTimeSpan = TimeSpan.FromMinutes(1.0)
@@ -50,7 +51,7 @@
                 let rec messageLoop = async { // (cirtuitBreaker : CircuitBreakerState) = async {
         
                     let! msg = inbox.Receive()
-                    let! res = sendFunction (connectionInfoProvider()) msg |> Async.Catch
+                    let! res = sendFunction msg |> Async.Catch
                 
                     match res with 
                         | Choice1Of2 _ -> return! messageLoop
@@ -70,7 +71,9 @@
         let internalLogging = base.ErrorHandler.Error
         let mutable connectionInfo = {Server="";Index="";Port=0;Bulk=false}
 
-        let agent = ProcessingAgents.mailboxProcessor (Helpers.sendFuncWithCircuitBreaker sendFunction internalLogging) (fun () -> connectionInfo) (fun msg -> internalLogging(msg))
+        let agent = 
+            let sendWithBreaker = Helpers.sendFuncWithCircuitBreaker sendFunction (fun () -> connectionInfo) (fun msg -> internalLogging(msg))
+            ProcessingAgents.mailboxProcessor sendWithBreaker (fun msg -> internalLogging(msg))
 
         new() = Appender(Communication.sendFunction())
 

@@ -27,8 +27,8 @@
 
             let dictionary = connectionString.Split(';') |> Array.map (fun s -> splitKeyValue s) |> dict
 
-            { Server="http://" + dictionary.["Server"]; Port=Int32.Parse(dictionary.["Port"]); Bulk = bufferSize > 0; Index=indexName dictionary }
-
+            { Server="http://" + dictionary.["Server"]; Port=Int32.Parse(dictionary.["Port"]); Index=indexName dictionary }
+            
         let policy internalErrorHanling = Policy.Handle<Exception>()
                                             .CircuitBreakerAsync(3, TimeSpan.FromMinutes(1.0), 
                                                 (fun ex span -> internalErrorHanling(sprintf "Failures during sending logs to Elasticsearch. Opening circuit breaker. %O" ex)), 
@@ -69,7 +69,7 @@
         inherit BufferingAppenderSkeleton()
         
         let internalLogging = base.ErrorHandler.Error
-        let mutable connectionInfo = {Server="";Index="";Port=0;Bulk=false}
+        let mutable connectionInfo = {Server="";Index="";Port=0}
 
         let agent = 
             let sendWithBreaker = Helpers.sendFuncWithCircuitBreaker sendFunction (fun () -> connectionInfo) (fun msg -> internalLogging(msg))

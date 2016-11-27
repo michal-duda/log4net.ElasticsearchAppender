@@ -18,14 +18,19 @@ module Communication =
         sb.AppendLine("{\"index\" : {} }").AppendLine(JsonConvert.SerializeObject(event))
 
     let private buildContent (events : LoggingEvent[]) : String = 
-        let serialized = events |> Array.fold (fun acc event -> appendLine event acc) (StringBuilder())
-        serialized.ToString()
+        if events.Length > 1 then
+            let serialized = events |> Array.fold (fun acc event -> appendLine event acc) (StringBuilder())
+            serialized.ToString()
+        else
+            JsonConvert.SerializeObject(events.[0])
 
     let sendFunction() : PostFunction<HttpStatusCode> = 
 
         let httpClient = new HttpClient()
         fun (connectionInfo : ConnectionInfo) (events : LoggingEvent[]) ->
-            let task = httpClient.PostAsync(connectionInfo.GetUrlString(),(new StringContent(buildContent events)), (new CancellationTokenSource(2000)).Token)
+            let request = new HttpRequestMessage(HttpMethod.Post, connectionInfo.GetPostUrlString(events.Length))
+            request.Content <- (new StringContent(buildContent events, Encoding.UTF8, "application/json"))
+            let task = httpClient.SendAsync(request, (new CancellationTokenSource(2000)).Token)
             Async.FromContinuations(fun (cont, econt, ccont) -> 
                 task.ContinueWith(fun (t:Task<HttpResponseMessage>) -> 
                     match t with
